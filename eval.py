@@ -67,7 +67,7 @@ PROMPT = (
 
 def parse_args():
     parser = ArgumentParser()
-    parser.add_argument("--data-dir", type=Path, default=Path("data"))
+    parser.add_argument("--data-dir", type=Path, default=Path("sample"))
     parser.add_argument("--model-id", default="qwen3-5-397b-a17b-fp8")
     parser.add_argument("--base-url", default=os.getenv("VLLM_BASE_URL"))
     parser.add_argument("--api-key", default=os.getenv("VLLM_API_KEY"))
@@ -117,21 +117,55 @@ async def predict(
     return json.loads(msg.content)
 
 
+SCALES = list(range(1, 20))
+
+
 def point_in_bbox(x: float, y: float, bbox: list[float]) -> bool:
     """bbox is [x_min, y_min, x_max, y_max] in normalized [0, 1] coordinates."""
     x_min, y_min, x_max, y_max = bbox
     return x_min <= x <= x_max and y_min <= y <= y_max
 
 
-def is_correct(pred: dict, sample: dict) -> bool:
+def scale_bbox(bbox: list[float], scale: float) -> list[float]:
+    """Scale bbox around its center by `scale` (linear), clipped to [0, 1]."""
+    x_min, y_min, x_max, y_max = bbox
+    cx = (x_min + x_max) / 2
+    cy = (y_min + y_max) / 2
+    half_w = (x_max - x_min) / 2 * scale
+    half_h = (y_max - y_min) / 2 * scale
+    return [
+        max(0.0, cx - half_w),
+        max(0.0, cy - half_h),
+        min(1.0, cx + half_w),
+        min(1.0, cy + half_h),
+    ]
+
+
+def evaluate_pred(pred: dict, sample: dict) -> dict:
+    """Per-sample correctness:
+    - start: predicted start point in the (unscaled) start bbox.
+    - end_by_scale: predicted end point in the end bbox scaled by `s`.
+    - by_scale: start AND end_by_scale[s] (combined pass@Nx).
+    """
     try:
         x1 = pred["x1"] / COORDINATES[1]
         y1 = pred["y1"] / COORDINATES[1]
         x2 = pred["x2"] / COORDINATES[1]
         y2 = pred["y2"] / COORDINATES[1]
     except (KeyError, TypeError):
-        return False
-    return point_in_bbox(x1, y1, sample["start_bbox"]) and point_in_bbox(x2, y2, sample["end_bbox"])
+        return {
+            "start": False,
+            "end_by_scale": {s: False for s in SCALES},
+            "by_scale": {s: False for s in SCALES},
+        }
+    start_ok = point_in_bbox(x1, y1, sample["start_bbox"])
+    end_by_scale: dict[int, bool] = {}
+    by_scale: dict[int, bool] = {}
+    for s in SCALES:
+        end_ok = point_in_bbox(x2, y2, scale_bbox(sample["end_bbox"], s))
+        end_by_scale[s] = end_ok
+        by_scale[s] = start_ok and end_ok
+    return {"start": start_ok, "end_by_scale": end_by_scale, "by_scale": by_scale}
 
 
 def iter_samples(data_dir: Path):
@@ -166,15 +200,23 @@ async def run_one(
                 task=intent,
                 reasoning_effort=reasoning_effort,
             )
-            ok = is_correct(pred, sample)
+            scores = evaluate_pred(pred, sample)
             error = None
         except Exception as e:
             pred = None
-            ok = False
+            scores = {
+                "start": False,
+                "end_by_scale": {s: False for s in SCALES},
+                "by_scale": {s: False for s in SCALES},
+            }
             error = repr(e)
 
+    ok = scores["by_scale"][1]
     state["total"] += 1
-    state["correct"] += int(ok)
+    state["correct_start"] += int(scores["start"])
+    for s in SCALES:
+        state["correct_end"][s] += int(scores["end_by_scale"][s])
+        state["correct"][s] += int(scores["by_scale"][s])
     if verbose:
         status = "OK" if ok else "FAIL"
         tqdm_asyncio.write(
@@ -188,6 +230,9 @@ async def run_one(
         "end_bbox": sample["end_bbox"],
         "prediction": pred,
         "correct": ok,
+        "correct_start": scores["start"],
+        "correct_end_by_scale": {str(s): scores["end_by_scale"][s] for s in SCALES},
+        "correct_by_scale": {str(s): scores["by_scale"][s] for s in SCALES},
         "error": error,
     }
 
@@ -205,7 +250,12 @@ async def run_eval(args) -> dict:
         for i, sample in enumerate(samples):
             work.append((img_path, i, sample))
 
-    state = {"correct": 0, "total": 0}
+    state = {
+        "correct": {s: 0 for s in SCALES},
+        "correct_end": {s: 0 for s in SCALES},
+        "correct_start": 0,
+        "total": 0,
+    }
     tasks = [
         run_one(
             sem=sem,
@@ -232,15 +282,29 @@ async def run_eval(args) -> dict:
     async for coro in pbar:
         result = await coro
         results.append(result)
+        total = state["total"]
         pbar.set_postfix(
-            acc=f"{state['correct']}/{state['total']}={state['correct'] / state['total']:.3f}"
+            start=f"{state['correct_start'] / total:.3f}",
+            end_1x=f"{state['correct_end'][1] / total:.3f}",
+            pass_1x=f"{state['correct'][1] / total:.3f}",
         )
 
     results.sort(key=lambda r: (r["image"], r["index"]))
+    total = state["total"]
+    safe_total = total or 1
+    accuracy_by_scale = {s: state["correct"][s] / safe_total for s in SCALES}
+    end_accuracy_by_scale = {s: state["correct_end"][s] / safe_total for s in SCALES}
+    start_accuracy = state["correct_start"] / safe_total
     return {
-        "accuracy": state["correct"] / state["total"] if state["total"] else 0.0,
-        "correct": state["correct"],
-        "total": state["total"],
+        "accuracy": accuracy_by_scale[1],
+        "correct": state["correct"][1],
+        "total": total,
+        "start_accuracy": start_accuracy,
+        "correct_start": state["correct_start"],
+        "end_accuracy_by_scale": {f"end@{s}x": end_accuracy_by_scale[s] for s in SCALES},
+        "correct_end_by_scale": {f"end@{s}x": state["correct_end"][s] for s in SCALES},
+        "accuracy_by_scale": {f"pass@{s}x": accuracy_by_scale[s] for s in SCALES},
+        "correct_by_scale": {f"pass@{s}x": state["correct"][s] for s in SCALES},
         "model_id": args.model_id,
         "reasoning_effort": args.reasoning_effort,
         "concurrency": args.concurrency,
@@ -252,7 +316,14 @@ def main():
     args = parse_args()
     summary = asyncio.run(run_eval(args))
     args.output.write_text(json.dumps(summary, indent=2))
-    print(f"Accuracy: {summary['correct']}/{summary['total']} = {summary['accuracy']:.4f}")
+    total = summary["total"]
+    print(f"start: {summary['correct_start']}/{total} = {summary['start_accuracy']:.4f}")
+    for label, acc in summary["end_accuracy_by_scale"].items():
+        correct = summary["correct_end_by_scale"][label]
+        print(f"{label}: {correct}/{total} = {acc:.4f}")
+    for label, acc in summary["accuracy_by_scale"].items():
+        correct = summary["correct_by_scale"][label]
+        print(f"{label}: {correct}/{total} = {acc:.4f}")
     print(f"Wrote results to {args.output}")
 
 
