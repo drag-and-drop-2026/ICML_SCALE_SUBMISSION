@@ -58,12 +58,11 @@ FORMAT = {
     "type": "object",
 }
 
-# Note: PROMPT contains literal `{` and `}` from the embedded JSON schema, so
-# the `{task}` placeholder is filled with .replace(), not str.format().
+_FORMAT_JSON = json.dumps(FORMAT)
 PROMPT = (
     "Localize the beginning and end of the vector on the GUI image according to the task and output the coordinates of the beginning and end of the vector. "
-    f"You must output a valid JSON following the format: {json.dumps(FORMAT)} "
-    f"Coordinates must be between 0 and {COORD_MAX}. "
+    "You must output a valid JSON following the format: {format_json} "
+    "Coordinates must be between 0 and {coord_max}. "
     "Your drag and drop task is: {task}"
 )
 
@@ -130,9 +129,7 @@ def evaluate_pred(pred: dict | None, sample: dict) -> tuple[bool, dict[int, bool
         return False, {s: False for s in SCALES}
     x1, y1, x2, y2 = coords
     start_ok = point_in_bbox(x1, y1, sample["start_bbox"])
-    end_by_scale = {
-        s: point_in_bbox(x2, y2, scale_bbox(sample["end_bbox"], s)) for s in SCALES
-    }
+    end_by_scale = {s: point_in_bbox(x2, y2, scale_bbox(sample["end_bbox"], s)) for s in SCALES}
     return start_ok, end_by_scale
 
 
@@ -146,16 +143,17 @@ def iter_samples(data_dir: Path):
                 yield img_path, i, sample
 
 
-async def predict(
-    client: AsyncOpenAI, args, image_url: str, task: str
-) -> dict:
+async def predict(client: AsyncOpenAI, args, image_url: str, task: str) -> dict:
     enable_thinking = args.reasoning_effort != "minimal"
     extra_kwargs = {"reasoning_effort": args.reasoning_effort} if enable_thinking else {}
     response = await client.chat.completions.create(
         model=args.model_id,
         messages=[
             {"role": "system", "content": "You are a GUI grounding assistant."},
-            {"role": "user", "content": PROMPT.replace("{task}", task)},
+            {
+                "role": "user",
+                "content": PROMPT.format(format_json=_FORMAT_JSON, coord_max=COORD_MAX, task=task),
+            },
             {
                 "role": "user",
                 "content": [{"type": "image_url", "image_url": {"url": image_url}}],
@@ -232,12 +230,8 @@ def summarize(results: list[dict], args) -> dict:
     total = len(results)
     safe = total or 1
     correct_start = sum(int(r["correct_start"]) for r in results)
-    correct_end = {
-        s: sum(int(r["correct_end_by_scale"][str(s)]) for r in results) for s in SCALES
-    }
-    correct = {
-        s: sum(int(r["correct_by_scale"][str(s)]) for r in results) for s in SCALES
-    }
+    correct_end = {s: sum(int(r["correct_end_by_scale"][str(s)]) for r in results) for s in SCALES}
+    correct = {s: sum(int(r["correct_by_scale"][str(s)]) for r in results) for s in SCALES}
     return {
         "accuracy": correct[1] / safe,
         "correct": correct[1],
@@ -270,9 +264,7 @@ async def gather_results(tasks: list) -> list[dict]:
     correct_start = 0
     correct_end_1x = 0
     correct_pass_1x = 0
-    pbar = tqdm_asyncio(
-        asyncio.as_completed(tasks), total=len(tasks), desc="eval", unit="sample"
-    )
+    pbar = tqdm_asyncio(asyncio.as_completed(tasks), total=len(tasks), desc="eval", unit="sample")
     async for coro in pbar:
         r = await coro
         results.append(r)
@@ -289,9 +281,7 @@ async def gather_results(tasks: list) -> list[dict]:
 
 
 async def run_eval(args) -> dict:
-    client = AsyncOpenAI(
-        base_url=f"{args.base_url}/{args.model_id}", api_key=args.api_key
-    )
+    client = AsyncOpenAI(base_url=f"{args.base_url}/{args.model_id}", api_key=args.api_key)
     sem = asyncio.Semaphore(args.concurrency)
     tasks = build_tasks(args, client, sem)
     results = await gather_results(tasks)
