@@ -13,6 +13,9 @@ from tqdm.asyncio import tqdm as tqdm_asyncio
 
 load_dotenv()
 
+COORD_MAX = 1000
+SCALES = list(range(1, 20))
+
 FORMAT = {
     "properties": {
         "action": {
@@ -55,12 +58,12 @@ FORMAT = {
     "type": "object",
 }
 
-COORDINATES = [0, 1000]
-
+# Note: PROMPT contains literal `{` and `}` from the embedded JSON schema, so
+# the `{task}` placeholder is filled with .replace(), not str.format().
 PROMPT = (
     "Localize the beginning and end of the vector on the GUI image according to the task and output the coordinates of the beginning and end of the vector. "
     f"You must output a valid JSON following the format: {json.dumps(FORMAT)} "
-    f"Coordinates must be between {COORDINATES[0]} and {COORDINATES[1]}. "
+    f"Coordinates must be between 0 and {COORD_MAX}. "
     "Your drag and drop task is: {task}"
 )
 
@@ -82,42 +85,10 @@ def parse_args():
     return parser.parse_args()
 
 
-def image_to_data_url(img: Image.Image) -> str:
+def image_to_data_url(path: Path) -> str:
     buf = io.BytesIO()
-    img.save(buf, format="PNG")
+    Image.open(path).convert("RGB").save(buf, format="PNG")
     return f"data:image/png;base64,{base64.b64encode(buf.getvalue()).decode()}"
-
-
-async def predict(
-    client: AsyncOpenAI,
-    model_id: str,
-    image_url: str,
-    task: str,
-    reasoning_effort: str,
-) -> dict:
-    enable_thinking = reasoning_effort != "minimal"
-    kwargs = {}
-    if enable_thinking:
-        kwargs["reasoning_effort"] = reasoning_effort
-    response = await client.chat.completions.create(
-        model=model_id,
-        messages=[
-            {"role": "system", "content": "You are a GUI grounding assistant."},
-            {"role": "user", "content": PROMPT.replace("{task}", task)},
-            {
-                "role": "user",
-                "content": [{"type": "image_url", "image_url": {"url": image_url}}],
-            },
-        ],
-        response_format={"type": "json_object"},
-        extra_body={"chat_template_kwargs": {"enable_thinking": enable_thinking}},
-        **kwargs,
-    )
-    msg = response.choices[0].message
-    return json.loads(msg.content)
-
-
-SCALES = list(range(1, 20))
 
 
 def point_in_bbox(x: float, y: float, bbox: list[float]) -> bool:
@@ -141,31 +112,28 @@ def scale_bbox(bbox: list[float], scale: float) -> list[float]:
     ]
 
 
-def evaluate_pred(pred: dict, sample: dict) -> dict:
-    """Per-sample correctness:
-    - start: predicted start point in the (unscaled) start bbox.
-    - end_by_scale: predicted end point in the end bbox scaled by `s`.
-    - by_scale: start AND end_by_scale[s] (combined pass@Nx).
-    """
-    try:
-        x1 = pred["x1"] / COORDINATES[1]
-        y1 = pred["y1"] / COORDINATES[1]
-        x2 = pred["x2"] / COORDINATES[1]
-        y2 = pred["y2"] / COORDINATES[1]
-    except (KeyError, TypeError):
-        return {
-            "start": False,
-            "end_by_scale": {s: False for s in SCALES},
-            "by_scale": {s: False for s in SCALES},
-        }
+def extract_coords(pred: dict | None) -> tuple[float, float, float, float] | None:
+    """Return normalized (x1, y1, x2, y2) in [0, 1], or None if pred is malformed."""
+    if not isinstance(pred, dict):
+        return None
+    keys = ("x1", "y1", "x2", "y2")
+    if not all(isinstance(pred.get(k), (int, float)) for k in keys):
+        return None
+    x1, y1, x2, y2 = (pred[k] / COORD_MAX for k in keys)
+    return x1, y1, x2, y2
+
+
+def evaluate_pred(pred: dict | None, sample: dict) -> tuple[bool, dict[int, bool]]:
+    """Return (start_ok, end_ok_by_scale) for a single prediction."""
+    coords = extract_coords(pred)
+    if coords is None:
+        return False, {s: False for s in SCALES}
+    x1, y1, x2, y2 = coords
     start_ok = point_in_bbox(x1, y1, sample["start_bbox"])
-    end_by_scale: dict[int, bool] = {}
-    by_scale: dict[int, bool] = {}
-    for s in SCALES:
-        end_ok = point_in_bbox(x2, y2, scale_bbox(sample["end_bbox"], s))
-        end_by_scale[s] = end_ok
-        by_scale[s] = start_ok and end_ok
-    return {"start": start_ok, "end_by_scale": end_by_scale, "by_scale": by_scale}
+    end_by_scale = {
+        s: point_in_bbox(x2, y2, scale_bbox(sample["end_bbox"], s)) for s in SCALES
+    }
+    return start_ok, end_by_scale
 
 
 def iter_samples(data_dir: Path):
@@ -174,142 +142,161 @@ def iter_samples(data_dir: Path):
         if not json_path.exists():
             continue
         with json_path.open() as f:
-            samples = json.load(f)
-        yield img_path, json_path, samples
+            for i, sample in enumerate(json.load(f)):
+                yield img_path, i, sample
+
+
+async def predict(
+    client: AsyncOpenAI, args, image_url: str, task: str
+) -> dict:
+    enable_thinking = args.reasoning_effort != "minimal"
+    extra_kwargs = {"reasoning_effort": args.reasoning_effort} if enable_thinking else {}
+    response = await client.chat.completions.create(
+        model=args.model_id,
+        messages=[
+            {"role": "system", "content": "You are a GUI grounding assistant."},
+            {"role": "user", "content": PROMPT.replace("{task}", task)},
+            {
+                "role": "user",
+                "content": [{"type": "image_url", "image_url": {"url": image_url}}],
+            },
+        ],
+        response_format={"type": "json_object"},
+        extra_body={"chat_template_kwargs": {"enable_thinking": enable_thinking}},
+        **extra_kwargs,
+    )
+    return json.loads(response.choices[0].message.content)
+
+
+async def safe_predict(
+    client: AsyncOpenAI, args, image_url: str, task: str
+) -> tuple[dict | None, str | None]:
+    """Run `predict`, returning (None, error_repr) instead of raising.
+
+    Needed so a single failed API call does not abort the whole batch.
+    """
+    try:
+        return await predict(client, args, image_url, task), None
+    except Exception as e:
+        return None, repr(e)
+
+
+def build_result(
+    img_path: Path,
+    index: int,
+    sample: dict,
+    pred: dict | None,
+    start_ok: bool,
+    end_by_scale: dict[int, bool],
+    error: str | None,
+) -> dict:
+    by_scale = {s: start_ok and end_by_scale[s] for s in SCALES}
+    return {
+        "image": img_path.name,
+        "index": index,
+        "intent": sample["intent"],
+        "start_bbox": sample["start_bbox"],
+        "end_bbox": sample["end_bbox"],
+        "prediction": pred,
+        "correct": by_scale[1],
+        "correct_start": start_ok,
+        "correct_end_by_scale": {str(s): end_by_scale[s] for s in SCALES},
+        "correct_by_scale": {str(s): by_scale[s] for s in SCALES},
+        "error": error,
+    }
 
 
 async def run_one(
     sem: asyncio.Semaphore,
     client: AsyncOpenAI,
-    model_id: str,
-    reasoning_effort: str,
+    args,
     img_path: Path,
     image_url: str,
     index: int,
     sample: dict,
-    state: dict,
-    verbose: bool,
 ) -> dict:
-    intent = sample["intent"]
     async with sem:
-        try:
-            pred = await predict(
-                client=client,
-                model_id=model_id,
-                image_url=image_url,
-                task=intent,
-                reasoning_effort=reasoning_effort,
-            )
-            scores = evaluate_pred(pred, sample)
-            error = None
-        except Exception as e:
-            pred = None
-            scores = {
-                "start": False,
-                "end_by_scale": {s: False for s in SCALES},
-                "by_scale": {s: False for s in SCALES},
-            }
-            error = repr(e)
-
-    ok = scores["by_scale"][1]
-    state["total"] += 1
-    state["correct_start"] += int(scores["start"])
-    for s in SCALES:
-        state["correct_end"][s] += int(scores["end_by_scale"][s])
-        state["correct"][s] += int(scores["by_scale"][s])
-    if verbose:
-        status = "OK" if ok else "FAIL"
+        pred, error = await safe_predict(client, args, image_url, sample["intent"])
+    start_ok, end_by_scale = evaluate_pred(pred, sample)
+    result = build_result(img_path, index, sample, pred, start_ok, end_by_scale, error)
+    if args.verbose:
+        status = "OK" if result["correct"] else "FAIL"
+        intent = sample["intent"]
         tqdm_asyncio.write(
             f"[{status}] {img_path.name}#{index}: {intent[:60]!r} -> {pred} err={error}"
         )
-    return {
-        "image": img_path.name,
-        "index": index,
-        "intent": intent,
-        "start_bbox": sample["start_bbox"],
-        "end_bbox": sample["end_bbox"],
-        "prediction": pred,
-        "correct": ok,
-        "correct_start": scores["start"],
-        "correct_end_by_scale": {str(s): scores["end_by_scale"][s] for s in SCALES},
-        "correct_by_scale": {str(s): scores["by_scale"][s] for s in SCALES},
-        "error": error,
+    return result
+
+
+def summarize(results: list[dict], args) -> dict:
+    total = len(results)
+    safe = total or 1
+    correct_start = sum(int(r["correct_start"]) for r in results)
+    correct_end = {
+        s: sum(int(r["correct_end_by_scale"][str(s)]) for r in results) for s in SCALES
     }
-
-
-async def run_eval(args) -> dict:
-    url = f"{args.base_url}/{args.model_id}"
-    client = AsyncOpenAI(base_url=url, api_key=args.api_key)
-    sem = asyncio.Semaphore(args.concurrency)
-
-    work = []
-    image_url_cache: dict[Path, str] = {}
-    for img_path, _json_path, samples in iter_samples(args.data_dir):
-        image = Image.open(img_path).convert("RGB")
-        image_url_cache[img_path] = image_to_data_url(image)
-        for i, sample in enumerate(samples):
-            work.append((img_path, i, sample))
-
-    state = {
-        "correct": {s: 0 for s in SCALES},
-        "correct_end": {s: 0 for s in SCALES},
-        "correct_start": 0,
-        "total": 0,
+    correct = {
+        s: sum(int(r["correct_by_scale"][str(s)]) for r in results) for s in SCALES
     }
-    tasks = [
-        run_one(
-            sem=sem,
-            client=client,
-            model_id=args.model_id,
-            reasoning_effort=args.reasoning_effort,
-            img_path=img_path,
-            image_url=image_url_cache[img_path],
-            index=i,
-            sample=sample,
-            state=state,
-            verbose=args.verbose,
-        )
-        for (img_path, i, sample) in work
-    ]
-
-    results = []
-    pbar = tqdm_asyncio(
-        asyncio.as_completed(tasks),
-        total=len(tasks),
-        desc="eval",
-        unit="sample",
-    )
-    async for coro in pbar:
-        result = await coro
-        results.append(result)
-        total = state["total"]
-        pbar.set_postfix(
-            start=f"{state['correct_start'] / total:.3f}",
-            end_1x=f"{state['correct_end'][1] / total:.3f}",
-            pass_1x=f"{state['correct'][1] / total:.3f}",
-        )
-
-    results.sort(key=lambda r: (r["image"], r["index"]))
-    total = state["total"]
-    safe_total = total or 1
-    accuracy_by_scale = {s: state["correct"][s] / safe_total for s in SCALES}
-    end_accuracy_by_scale = {s: state["correct_end"][s] / safe_total for s in SCALES}
-    start_accuracy = state["correct_start"] / safe_total
     return {
-        "accuracy": accuracy_by_scale[1],
-        "correct": state["correct"][1],
+        "accuracy": correct[1] / safe,
+        "correct": correct[1],
         "total": total,
-        "start_accuracy": start_accuracy,
-        "correct_start": state["correct_start"],
-        "end_accuracy_by_scale": {f"end@{s}x": end_accuracy_by_scale[s] for s in SCALES},
-        "correct_end_by_scale": {f"end@{s}x": state["correct_end"][s] for s in SCALES},
-        "accuracy_by_scale": {f"pass@{s}x": accuracy_by_scale[s] for s in SCALES},
-        "correct_by_scale": {f"pass@{s}x": state["correct"][s] for s in SCALES},
+        "start_accuracy": correct_start / safe,
+        "correct_start": correct_start,
+        "end_accuracy_by_scale": {f"end@{s}x": correct_end[s] / safe for s in SCALES},
+        "correct_end_by_scale": {f"end@{s}x": correct_end[s] for s in SCALES},
+        "accuracy_by_scale": {f"pass@{s}x": correct[s] / safe for s in SCALES},
+        "correct_by_scale": {f"pass@{s}x": correct[s] for s in SCALES},
         "model_id": args.model_id,
         "reasoning_effort": args.reasoning_effort,
         "concurrency": args.concurrency,
         "results": results,
     }
+
+
+def build_tasks(args, client: AsyncOpenAI, sem: asyncio.Semaphore) -> list:
+    image_urls: dict[Path, str] = {}
+    tasks = []
+    for img_path, i, sample in iter_samples(args.data_dir):
+        if img_path not in image_urls:
+            image_urls[img_path] = image_to_data_url(img_path)
+        tasks.append(run_one(sem, client, args, img_path, image_urls[img_path], i, sample))
+    return tasks
+
+
+async def gather_results(tasks: list) -> list[dict]:
+    results: list[dict] = []
+    correct_start = 0
+    correct_end_1x = 0
+    correct_pass_1x = 0
+    pbar = tqdm_asyncio(
+        asyncio.as_completed(tasks), total=len(tasks), desc="eval", unit="sample"
+    )
+    async for coro in pbar:
+        r = await coro
+        results.append(r)
+        correct_start += int(r["correct_start"])
+        correct_end_1x += int(r["correct_end_by_scale"]["1"])
+        correct_pass_1x += int(r["correct_by_scale"]["1"])
+        n = len(results)
+        pbar.set_postfix(
+            start=f"{correct_start / n:.3f}",
+            end_1x=f"{correct_end_1x / n:.3f}",
+            pass_1x=f"{correct_pass_1x / n:.3f}",
+        )
+    return results
+
+
+async def run_eval(args) -> dict:
+    client = AsyncOpenAI(
+        base_url=f"{args.base_url}/{args.model_id}", api_key=args.api_key
+    )
+    sem = asyncio.Semaphore(args.concurrency)
+    tasks = build_tasks(args, client, sem)
+    results = await gather_results(tasks)
+    results.sort(key=lambda r: (r["image"], r["index"]))
+    return summarize(results, args)
 
 
 def main():
@@ -318,12 +305,12 @@ def main():
     args.output.write_text(json.dumps(summary, indent=2))
     total = summary["total"]
     print(f"start: {summary['correct_start']}/{total} = {summary['start_accuracy']:.4f}")
-    for label, acc in summary["end_accuracy_by_scale"].items():
-        correct = summary["correct_end_by_scale"][label]
-        print(f"{label}: {correct}/{total} = {acc:.4f}")
-    for label, acc in summary["accuracy_by_scale"].items():
-        correct = summary["correct_by_scale"][label]
-        print(f"{label}: {correct}/{total} = {acc:.4f}")
+    for acc_key, count_key in [
+        ("end_accuracy_by_scale", "correct_end_by_scale"),
+        ("accuracy_by_scale", "correct_by_scale"),
+    ]:
+        for label, acc in summary[acc_key].items():
+            print(f"{label}: {summary[count_key][label]}/{total} = {acc:.4f}")
     print(f"Wrote results to {args.output}")
 
 
