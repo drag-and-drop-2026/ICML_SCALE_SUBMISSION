@@ -23,18 +23,25 @@ def _coord_prop(axis: str, kind: str, coord_format: str, x_max: int, y_max: int)
     """Build a JSON schema property for an x/y coordinate."""
     is_x = axis == "x"
     title = f"{axis.upper()}{kind}"
-    max_value = (x_max if is_x else y_max) if coord_format == "pixel" else COORD_MAX
-    if coord_format == "pixel":
-        units = f"in image pixels (image is {x_max} wide by {y_max} tall)"
-    else:
-        units = f"normalized between 0 and {COORD_MAX}"
     point = "start" if kind == "1" else "end"
+    if coord_format == "pixel":
+        max_value = x_max if is_x else y_max
+        units = f"in image pixels (image is {x_max} wide by {y_max} tall)"
+        type_ = "integer"
+    elif coord_format == "unit":
+        max_value = 1
+        units = "as a fraction of the image, between 0 and 1"
+        type_ = "number"
+    else:
+        max_value = COORD_MAX
+        units = f"normalized between 0 and {COORD_MAX}"
+        type_ = "integer"
     return {
         "description": f"The {axis} coordinate of the {point} of the drag, {units}",
         "maximum": max_value,
         "minimum": 0,
         "title": title,
-        "type": "integer",
+        "type": type_,
     }
 
 
@@ -72,10 +79,19 @@ PROMPT_PIXEL = (
     "Your drag and drop task is: {task}"
 )
 
+PROMPT_UNIT = (
+    "Localize the beginning and end of the vector on the GUI image according to the task and output the coordinates of the beginning and end of the vector. "
+    "You must output a valid JSON following the format: {format_json} "
+    "Coordinates must be expressed as fractions of the image dimensions, between 0.0 and 1.0 (use decimals, e.g. 0.523). "
+    "Your drag and drop task is: {task}"
+)
+
 
 def format_prompt(coord_format: str, format_json: str, width: int, height: int, task: str) -> str:
     if coord_format == "pixel":
         return PROMPT_PIXEL.format(format_json=format_json, width=width, height=height, task=task)
+    if coord_format == "unit":
+        return PROMPT_UNIT.format(format_json=format_json, task=task)
     return PROMPT_NORMALIZED.format(format_json=format_json, coord_max=COORD_MAX, task=task)
 
 
@@ -94,6 +110,11 @@ BACKENDS = {
         "default_base_url": "https://api.anthropic.com/v1",
         "api_key": os.getenv("ANTHROPIC_API_KEY"),
         "coord_format": "pixel",
+    },
+    "together": {
+        "default_base_url": "https://api.together.xyz/v1",
+        "api_key": os.getenv("TOGETHER_API_KEY"),
+        "coord_format": "unit",
     },
 }
 
@@ -176,6 +197,8 @@ def extract_coords(
         y1 = pred["y1"] / height
         x2 = pred["x2"] / width
         y2 = pred["y2"] / height
+    elif coord_format == "unit":
+        x1, y1, x2, y2 = (float(pred[k]) for k in keys)
     else:
         x1, y1, x2, y2 = (pred[k] / COORD_MAX for k in keys)
     return x1, y1, x2, y2
@@ -223,7 +246,14 @@ def iter_samples(data_dir: Path):
 
 def completion_kwargs(args) -> dict:
     if args.backend == "anthropic":
-        return {}
+        return {"extra_body": {"thinking": {"type": "disabled"}}}
+    if args.backend == "together":
+        return {
+            "response_format": {"type": "json_object"},
+            "temperature": 0.6,
+            "top_p": 0.95,
+            "extra_body": {"reasoning": {"enabled": False}},
+        }
     return {"response_format": {"type": "json_object"}}
 
 
@@ -498,8 +528,9 @@ def main():
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    results_path = args.output_dir / f"results_{args.model_id}_{timestamp}.json"
-    aggregated_path = args.output_dir / f"aggregated_{args.model_id}_{timestamp}.json"
+    safe_model_id = args.model_id.replace("/", "_")
+    results_path = args.output_dir / f"results_{safe_model_id}_{timestamp}.json"
+    aggregated_path = args.output_dir / f"aggregated_{safe_model_id}_{timestamp}.json"
 
     results_path.write_text(json.dumps(summary, indent=2))
     aggregated_path.write_text(json.dumps(aggregate_only(summary), indent=2))
