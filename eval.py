@@ -386,29 +386,6 @@ def print_aggregate(label: str, agg: dict):
             print(f"{k}: {agg[count_key][k]}/{total} = {acc:.4f}")
 
 
-LATEX_TEMPLATE = (
-    "% accuracy@{n}x\n"
-    "   &  \\small{{Text Highlighting}} & \\small{{Cell Selection}}"
-    " & \\small{{Element Resizing}} & \\small{{Slider Manipulation}}"
-    " & \\small{{Total}} \\\\ \\hline\n"
-    "  {model} & {text_highlight} & {sheet} & {slide_resize} & {slider} & {total} \\\\"
-)
-LATEX_DOMAINS = ["text_highlight", "sheet", "slide_resize", "slider"]
-
-
-def _pct(agg: dict | None, scale: int) -> str:
-    if not agg or agg["total"] == 0:
-        return "-"
-    return f"{agg['accuracy_by_scale'][f'accuracy@{scale}x'] * 100:.1f}\\%"
-
-
-def print_latex_rows(summary: dict, model_id: str):
-    print()
-    for n in SCALES:
-        cells = {d: _pct(summary["by_domain"].get(d), n) for d in LATEX_DOMAINS}
-        print(LATEX_TEMPLATE.format(n=n, model=model_id, total=_pct(summary, n), **cells))
-
-
 def aggregate_only(summary: dict) -> dict:
     return {k: v for k, v in summary.items() if k != "results"} | {
         "by_domain": {d: dict(agg) for d, agg in summary["by_domain"].items()},
@@ -433,7 +410,6 @@ def main():
     print_aggregate("overall", summary)
     print(f"\nWrote full results to {results_path}")
     print(f"Wrote aggregated results to {aggregated_path}")
-    print_latex_rows(summary, args.model_id)
 
 
 if __name__ == "__main__":
