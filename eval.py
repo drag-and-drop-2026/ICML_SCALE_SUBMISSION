@@ -254,6 +254,11 @@ def completion_kwargs(args) -> dict:
             "top_p": 0.95,
             "extra_body": {"reasoning": {"enabled": False}},
         }
+    if args.backend == "vllm":
+        return {
+            "response_format": {"type": "json_object"},
+            "extra_body": {"chat_template_kwargs": {"enable_thinking": False}},
+        }
     return {"response_format": {"type": "json_object"}}
 
 
@@ -333,7 +338,11 @@ async def predict(
         ],
         **completion_kwargs(args),
     )
-    return parse_json_response(response.choices[0].message.content)
+    try:
+        return parse_json_response(response.choices[0].message.content)
+    except json.JSONDecodeError:
+        tqdm_asyncio.write(f"\nRAW_RESPONSE {response.model_dump_json()}")
+        raise
 
 
 async def safe_predict(
