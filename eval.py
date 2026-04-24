@@ -3,6 +3,7 @@ import base64
 import io
 import json
 import os
+import re
 from argparse import ArgumentParser
 from datetime import datetime
 from pathlib import Path
@@ -226,6 +227,58 @@ def completion_kwargs(args) -> dict:
     return {"response_format": {"type": "json_object"}}
 
 
+_FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.DOTALL | re.IGNORECASE)
+
+
+def _extract_json_object(text: str) -> str | None:
+    """Find the first balanced {...} JSON object in text (ignoring braces in strings)."""
+    depth = 0
+    start = -1
+    in_str = False
+    esc = False
+    for i, ch in enumerate(text):
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0 and start != -1:
+                return text[start : i + 1]
+    return None
+
+
+def parse_json_response(content: str) -> dict:
+    """Parse JSON from a model response, tolerating code fences and surrounding prose."""
+    if content is None:
+        raise json.JSONDecodeError("empty response", "", 0)
+    text = content.strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    m = _FENCE_RE.search(text)
+    if m:
+        try:
+            return json.loads(m.group(1).strip())
+        except json.JSONDecodeError:
+            pass
+    obj = _extract_json_object(text)
+    if obj is not None:
+        return json.loads(obj)
+    raise json.JSONDecodeError(f"no JSON object found in: {text[:200]!r}", text, 0)
+
+
 async def predict(
     client: AsyncOpenAI, args, image_url: str, width: int, height: int, task: str
 ) -> dict:
@@ -234,7 +287,14 @@ async def predict(
     response = await client.chat.completions.create(
         model=args.model_id,
         messages=[
-            {"role": "system", "content": "You are a GUI grounding assistant."},
+            {
+                "role": "system",
+                "content": (
+                    "You are a GUI grounding assistant. "
+                    "Respond with ONLY a single JSON object matching the requested schema, "
+                    "with no prose, no explanations, and no markdown code fences."
+                ),
+            },
             {"role": "user", "content": prompt},
             {
                 "role": "user",
@@ -243,7 +303,7 @@ async def predict(
         ],
         **completion_kwargs(args),
     )
-    return json.loads(response.choices[0].message.content)
+    return parse_json_response(response.choices[0].message.content)
 
 
 async def safe_predict(
