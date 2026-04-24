@@ -4,6 +4,7 @@ import io
 import json
 import os
 from argparse import ArgumentParser
+from datetime import datetime
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -14,7 +15,7 @@ from tqdm.asyncio import tqdm as tqdm_asyncio
 load_dotenv()
 
 COORD_MAX = 1000
-SCALES = list(range(1, 20))
+SCALES = [1, 2, 3]
 
 FORMAT = {
     "properties": {
@@ -67,27 +68,62 @@ PROMPT = (
 )
 
 
+BACKENDS = {
+    "vllm": {
+        "default_base_url": os.getenv("VLLM_BASE_URL"),
+        "api_key": os.getenv("VLLM_API_KEY"),
+    },
+    "openai": {
+        "default_base_url": "https://api.openai.com/v1",
+        "api_key": os.getenv("OPENAI_API_KEY"),
+    },
+    "anthropic": {
+        "default_base_url": "https://api.anthropic.com/v1",
+        "api_key": os.getenv("ANTHROPIC_API_KEY"),
+    },
+}
+
+
 def parse_args():
     parser = ArgumentParser()
-    parser.add_argument("--data-dir", type=Path, default=Path("sample"))
+    parser.add_argument("--data-dir", type=Path, default=Path("data"))
     parser.add_argument("--model-id", default="qwen3-5-397b-a17b-fp8")
-    parser.add_argument("--base-url", default=os.getenv("VLLM_BASE_URL"))
-    parser.add_argument("--api-key", default=os.getenv("VLLM_API_KEY"))
-    parser.add_argument("--output", type=Path, default=Path("results.json"))
+    parser.add_argument("--backend", default="vllm", choices=list(BACKENDS))
+    parser.add_argument("--base-url", default=None)
+    parser.add_argument("--api-key", default=None)
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=Path("results"),
+        help="Directory to write results_<model>_<timestamp>.json and aggregated_<model>_<timestamp>.json",
+    )
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--concurrency", type=int, default=50)
-    parser.add_argument(
-        "--reasoning-effort",
-        default="minimal",
-        choices=["minimal", "low", "medium", "high"],
-    )
-    return parser.parse_args()
+    args = parser.parse_args()
+    cfg = BACKENDS[args.backend]
+    if args.base_url is None:
+        args.base_url = cfg["default_base_url"]
+    if args.api_key is None:
+        args.api_key = cfg["api_key"]
+    if not args.base_url:
+        parser.error(f"--base-url not set for backend={args.backend!r}")
+    return args
 
 
-def image_to_data_url(path: Path) -> str:
+def load_image(path: Path) -> tuple[str, int, int]:
+    """Return (data_url, width, height) for an image."""
+    img = Image.open(path).convert("RGB")
+    width, height = img.size
     buf = io.BytesIO()
-    Image.open(path).convert("RGB").save(buf, format="PNG")
-    return f"data:image/png;base64,{base64.b64encode(buf.getvalue()).decode()}"
+    img.save(buf, format="PNG")
+    data_url = f"data:image/png;base64,{base64.b64encode(buf.getvalue()).decode()}"
+    return data_url, width, height
+
+
+def normalize_bbox(bbox: list[float], width: int, height: int) -> list[float]:
+    """Convert a pixel-space bbox [x_min, y_min, x_max, y_max] to normalized [0, 1]."""
+    x_min, y_min, x_max, y_max = bbox
+    return [x_min / width, y_min / height, x_max / width, y_max / height]
 
 
 def point_in_bbox(x: float, y: float, bbox: list[float]) -> bool:
@@ -133,19 +169,40 @@ def evaluate_pred(pred: dict | None, sample: dict) -> tuple[bool, dict[int, bool
     return start_ok, end_by_scale
 
 
-def iter_samples(data_dir: Path):
-    for img_path in sorted(data_dir.glob("*.jpg")):
-        json_path = img_path.with_suffix(".json")
-        if not json_path.exists():
+def iter_image_paths(data_dir: Path):
+    """Yield (domain, image_path, tasks_path) tuples for all images under data_dir.
+
+    Supports both the new layout (data_dir/<domain>/{images,tasks}/<id>.{jpg,json})
+    and a single-domain layout (data_dir/{images,tasks}/<id>.{jpg,json}).
+    """
+    images_dirs = sorted(data_dir.rglob("images"))
+    for images_dir in images_dirs:
+        if not images_dir.is_dir():
             continue
-        with json_path.open() as f:
+        tasks_dir = images_dir.with_name("tasks")
+        if not tasks_dir.is_dir():
+            continue
+        domain = images_dir.parent.name
+        for img_path in sorted(images_dir.glob("*.jpg")):
+            tasks_path = tasks_dir / f"{img_path.stem}.json"
+            if tasks_path.exists():
+                yield domain, img_path, tasks_path
+
+
+def iter_samples(data_dir: Path):
+    for domain, img_path, tasks_path in iter_image_paths(data_dir):
+        with tasks_path.open() as f:
             for i, sample in enumerate(json.load(f)):
-                yield img_path, i, sample
+                yield domain, img_path, i, sample
+
+
+def completion_kwargs(args) -> dict:
+    if args.backend == "anthropic":
+        return {}
+    return {"response_format": {"type": "json_object"}}
 
 
 async def predict(client: AsyncOpenAI, args, image_url: str, task: str) -> dict:
-    enable_thinking = args.reasoning_effort != "minimal"
-    extra_kwargs = {"reasoning_effort": args.reasoning_effort} if enable_thinking else {}
     response = await client.chat.completions.create(
         model=args.model_id,
         messages=[
@@ -159,9 +216,7 @@ async def predict(client: AsyncOpenAI, args, image_url: str, task: str) -> dict:
                 "content": [{"type": "image_url", "image_url": {"url": image_url}}],
             },
         ],
-        response_format={"type": "json_object"},
-        extra_body={"chat_template_kwargs": {"enable_thinking": enable_thinking}},
-        **extra_kwargs,
+        **completion_kwargs(args),
     )
     return json.loads(response.choices[0].message.content)
 
@@ -169,10 +224,6 @@ async def predict(client: AsyncOpenAI, args, image_url: str, task: str) -> dict:
 async def safe_predict(
     client: AsyncOpenAI, args, image_url: str, task: str
 ) -> tuple[dict | None, str | None]:
-    """Run `predict`, returning (None, error_repr) instead of raising.
-
-    Needed so a single failed API call does not abort the whole batch.
-    """
     try:
         return await predict(client, args, image_url, task), None
     except Exception as e:
@@ -180,9 +231,11 @@ async def safe_predict(
 
 
 def build_result(
+    domain: str,
     img_path: Path,
     index: int,
     sample: dict,
+    norm_sample: dict,
     pred: dict | None,
     start_ok: bool,
     end_by_scale: dict[int, bool],
@@ -190,11 +243,16 @@ def build_result(
 ) -> dict:
     by_scale = {s: start_ok and end_by_scale[s] for s in SCALES}
     return {
+        "domain": domain,
+        "subtype": sample.get("subtype"),
         "image": img_path.name,
+        "image_id": sample.get("image_id", img_path.stem),
         "index": index,
         "intent": sample["intent"],
-        "start_bbox": sample["start_bbox"],
-        "end_bbox": sample["end_bbox"],
+        "start_bbox_px": sample["start_bbox"],
+        "end_bbox_px": sample["end_bbox"],
+        "start_bbox": norm_sample["start_bbox"],
+        "end_bbox": norm_sample["end_bbox"],
         "prediction": pred,
         "correct": by_scale[1],
         "correct_start": start_ok,
@@ -208,25 +266,29 @@ async def run_one(
     sem: asyncio.Semaphore,
     client: AsyncOpenAI,
     args,
+    domain: str,
     img_path: Path,
     image_url: str,
     index: int,
     sample: dict,
+    norm_sample: dict,
 ) -> dict:
     async with sem:
         pred, error = await safe_predict(client, args, image_url, sample["intent"])
-    start_ok, end_by_scale = evaluate_pred(pred, sample)
-    result = build_result(img_path, index, sample, pred, start_ok, end_by_scale, error)
+    start_ok, end_by_scale = evaluate_pred(pred, norm_sample)
+    result = build_result(
+        domain, img_path, index, sample, norm_sample, pred, start_ok, end_by_scale, error
+    )
     if args.verbose:
         status = "OK" if result["correct"] else "FAIL"
         intent = sample["intent"]
         tqdm_asyncio.write(
-            f"[{status}] {img_path.name}#{index}: {intent[:60]!r} -> {pred} err={error}"
+            f"[{status}] {domain}/{img_path.name}#{index}: {intent[:60]!r} -> {pred} err={error}"
         )
     return result
 
 
-def summarize(results: list[dict], args) -> dict:
+def _aggregate(results: list[dict]) -> dict:
     total = len(results)
     safe = total or 1
     correct_start = sum(int(r["correct_start"]) for r in results)
@@ -240,22 +302,39 @@ def summarize(results: list[dict], args) -> dict:
         "correct_start": correct_start,
         "end_accuracy_by_scale": {f"end@{s}x": correct_end[s] / safe for s in SCALES},
         "correct_end_by_scale": {f"end@{s}x": correct_end[s] for s in SCALES},
-        "accuracy_by_scale": {f"pass@{s}x": correct[s] / safe for s in SCALES},
-        "correct_by_scale": {f"pass@{s}x": correct[s] for s in SCALES},
+        "accuracy_by_scale": {f"accuracy@{s}x": correct[s] / safe for s in SCALES},
+        "correct_by_scale": {f"accuracy@{s}x": correct[s] for s in SCALES},
+    }
+
+
+def summarize(results: list[dict], args) -> dict:
+    by_domain: dict[str, list[dict]] = {}
+    for r in results:
+        by_domain.setdefault(r["domain"], []).append(r)
+    return {
+        **_aggregate(results),
+        "by_domain": {d: _aggregate(rs) for d, rs in sorted(by_domain.items())},
         "model_id": args.model_id,
-        "reasoning_effort": args.reasoning_effort,
         "concurrency": args.concurrency,
         "results": results,
     }
 
 
 def build_tasks(args, client: AsyncOpenAI, sem: asyncio.Semaphore) -> list:
-    image_urls: dict[Path, str] = {}
+    cache: dict[Path, tuple[str, int, int]] = {}
     tasks = []
-    for img_path, i, sample in iter_samples(args.data_dir):
-        if img_path not in image_urls:
-            image_urls[img_path] = image_to_data_url(img_path)
-        tasks.append(run_one(sem, client, args, img_path, image_urls[img_path], i, sample))
+    for domain, img_path, i, sample in iter_samples(args.data_dir):
+        if img_path not in cache:
+            cache[img_path] = load_image(img_path)
+        image_url, width, height = cache[img_path]
+        norm_sample = {
+            **sample,
+            "start_bbox": normalize_bbox(sample["start_bbox"], width, height),
+            "end_bbox": normalize_bbox(sample["end_bbox"], width, height),
+        }
+        tasks.append(
+            run_one(sem, client, args, domain, img_path, image_url, i, sample, norm_sample)
+        )
     return tasks
 
 
@@ -280,28 +359,81 @@ async def gather_results(tasks: list) -> list[dict]:
     return results
 
 
+def client_base_url(args) -> str:
+    if args.backend == "vllm":
+        return f"{args.base_url}/{args.model_id}"
+    return args.base_url
+
+
 async def run_eval(args) -> dict:
-    client = AsyncOpenAI(base_url=f"{args.base_url}/{args.model_id}", api_key=args.api_key)
+    client = AsyncOpenAI(base_url=client_base_url(args), api_key=args.api_key)
     sem = asyncio.Semaphore(args.concurrency)
     tasks = build_tasks(args, client, sem)
     results = await gather_results(tasks)
-    results.sort(key=lambda r: (r["image"], r["index"]))
+    results.sort(key=lambda r: (r["domain"], r["image"], r["index"]))
     return summarize(results, args)
 
 
-def main():
-    args = parse_args()
-    summary = asyncio.run(run_eval(args))
-    args.output.write_text(json.dumps(summary, indent=2))
-    total = summary["total"]
-    print(f"start: {summary['correct_start']}/{total} = {summary['start_accuracy']:.4f}")
+def print_aggregate(label: str, agg: dict):
+    total = agg["total"]
+    print(f"\n== {label} (n={total}) ==")
+    print(f"start: {agg['correct_start']}/{total} = {agg['start_accuracy']:.4f}")
     for acc_key, count_key in [
         ("end_accuracy_by_scale", "correct_end_by_scale"),
         ("accuracy_by_scale", "correct_by_scale"),
     ]:
-        for label, acc in summary[acc_key].items():
-            print(f"{label}: {summary[count_key][label]}/{total} = {acc:.4f}")
-    print(f"Wrote results to {args.output}")
+        for k, acc in agg[acc_key].items():
+            print(f"{k}: {agg[count_key][k]}/{total} = {acc:.4f}")
+
+
+LATEX_TEMPLATE = (
+    "% accuracy@{n}x\n"
+    "   &  \\small{{Text Highlighting}} & \\small{{Cell Selection}}"
+    " & \\small{{Element Resizing}} & \\small{{Slider Manipulation}}"
+    " & \\small{{Total}} \\\\ \\hline\n"
+    "  {model} & {text_highlight} & {sheet} & {slide_resize} & {slider} & {total} \\\\"
+)
+LATEX_DOMAINS = ["text_highlight", "sheet", "slide_resize", "slider"]
+
+
+def _pct(agg: dict | None, scale: int) -> str:
+    if not agg or agg["total"] == 0:
+        return "-"
+    return f"{agg['accuracy_by_scale'][f'accuracy@{scale}x'] * 100:.1f}\\%"
+
+
+def print_latex_rows(summary: dict, model_id: str):
+    print()
+    for n in SCALES:
+        cells = {d: _pct(summary["by_domain"].get(d), n) for d in LATEX_DOMAINS}
+        print(LATEX_TEMPLATE.format(n=n, model=model_id, total=_pct(summary, n), **cells))
+
+
+def aggregate_only(summary: dict) -> dict:
+    return {k: v for k, v in summary.items() if k != "results"} | {
+        "by_domain": {d: dict(agg) for d, agg in summary["by_domain"].items()},
+    }
+
+
+def main():
+    args = parse_args()
+    print(args)
+    summary = asyncio.run(run_eval(args))
+
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    results_path = args.output_dir / f"results_{args.model_id}_{timestamp}.json"
+    aggregated_path = args.output_dir / f"aggregated_{args.model_id}_{timestamp}.json"
+
+    results_path.write_text(json.dumps(summary, indent=2))
+    aggregated_path.write_text(json.dumps(aggregate_only(summary), indent=2))
+
+    for domain, agg in summary["by_domain"].items():
+        print_aggregate(domain, agg)
+    print_aggregate("overall", summary)
+    print(f"\nWrote full results to {results_path}")
+    print(f"Wrote aggregated results to {aggregated_path}")
+    print_latex_rows(summary, args.model_id)
 
 
 if __name__ == "__main__":

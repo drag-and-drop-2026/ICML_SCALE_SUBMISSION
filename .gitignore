@@ -209,6 +209,6 @@ __marimo__/
 
 .DS_Store
 data/
-results*.json
+results/
 .python-version
 
