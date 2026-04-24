@@ -134,6 +134,11 @@ def parse_args():
     )
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--concurrency", type=int, default=50)
+    parser.add_argument(
+        "--reasoning",
+        action="store_true",
+        help="Enable model reasoning/thinking mode (vllm: Qwen `enable_thinking=True`).",
+    )
     args = parser.parse_args()
     cfg = BACKENDS[args.backend]
     if args.base_url is None:
@@ -257,7 +262,7 @@ def completion_kwargs(args) -> dict:
     if args.backend == "vllm":
         return {
             "response_format": {"type": "json_object"},
-            "extra_body": {"chat_template_kwargs": {"enable_thinking": False}},
+            "extra_body": {"chat_template_kwargs": {"enable_thinking": args.reasoning}},
         }
     return {"response_format": {"type": "json_object"}}
 
