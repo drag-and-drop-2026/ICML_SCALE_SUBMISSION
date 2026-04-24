@@ -17,69 +17,82 @@ load_dotenv()
 COORD_MAX = 1000
 SCALES = [1, 2, 3]
 
-FORMAT = {
-    "properties": {
-        "action": {
-            "const": "drag_and_drop",
-            "default": "drag_and_drop",
-            "title": "Action",
-            "type": "string",
-        },
-        "x1": {
-            "description": "The x coordinate of the start of the drag, normalized between 0 and 1000",
-            "maximum": 1000,
-            "minimum": 0,
-            "title": "X1",
-            "type": "integer",
-        },
-        "y1": {
-            "description": "The y coordinate of the start of the drag, normalized between 0 and 1000",
-            "maximum": 1000,
-            "minimum": 0,
-            "title": "Y1",
-            "type": "integer",
-        },
-        "x2": {
-            "description": "The x coordinate of the end of the drag, normalized between 0 and 1000",
-            "maximum": 1000,
-            "minimum": 0,
-            "title": "X2",
-            "type": "integer",
-        },
-        "y2": {
-            "description": "The y coordinate of the end of the drag, normalized between 0 and 1000",
-            "maximum": 1000,
-            "minimum": 0,
-            "title": "Y2",
-            "type": "integer",
-        },
-    },
-    "required": ["x1", "y1", "x2", "y2"],
-    "title": "DragAndDropAction",
-    "type": "object",
-}
 
-_FORMAT_JSON = json.dumps(FORMAT)
-PROMPT = (
+def _coord_prop(axis: str, kind: str, coord_format: str, x_max: int, y_max: int) -> dict:
+    """Build a JSON schema property for an x/y coordinate."""
+    is_x = axis == "x"
+    title = f"{axis.upper()}{kind}"
+    max_value = (x_max if is_x else y_max) if coord_format == "pixel" else COORD_MAX
+    if coord_format == "pixel":
+        units = f"in image pixels (image is {x_max} wide by {y_max} tall)"
+    else:
+        units = f"normalized between 0 and {COORD_MAX}"
+    point = "start" if kind == "1" else "end"
+    return {
+        "description": f"The {axis} coordinate of the {point} of the drag, {units}",
+        "maximum": max_value,
+        "minimum": 0,
+        "title": title,
+        "type": "integer",
+    }
+
+
+def build_format(coord_format: str, width: int, height: int) -> dict:
+    return {
+        "properties": {
+            "action": {
+                "const": "drag_and_drop",
+                "default": "drag_and_drop",
+                "title": "Action",
+                "type": "string",
+            },
+            "x1": _coord_prop("x", "1", coord_format, width, height),
+            "y1": _coord_prop("y", "1", coord_format, width, height),
+            "x2": _coord_prop("x", "2", coord_format, width, height),
+            "y2": _coord_prop("y", "2", coord_format, width, height),
+        },
+        "required": ["x1", "y1", "x2", "y2"],
+        "title": "DragAndDropAction",
+        "type": "object",
+    }
+
+
+PROMPT_NORMALIZED = (
     "Localize the beginning and end of the vector on the GUI image according to the task and output the coordinates of the beginning and end of the vector. "
     "You must output a valid JSON following the format: {format_json} "
     "Coordinates must be between 0 and {coord_max}. "
     "Your drag and drop task is: {task}"
 )
 
+PROMPT_PIXEL = (
+    "Localize the beginning and end of the vector on the GUI image according to the task and output the coordinates of the beginning and end of the vector. "
+    "You must output a valid JSON following the format: {format_json} "
+    "Coordinates must be in image pixels: x in [0, {width}] and y in [0, {height}]. "
+    "Your drag and drop task is: {task}"
+)
+
+
+def format_prompt(coord_format: str, format_json: str, width: int, height: int, task: str) -> str:
+    if coord_format == "pixel":
+        return PROMPT_PIXEL.format(format_json=format_json, width=width, height=height, task=task)
+    return PROMPT_NORMALIZED.format(format_json=format_json, coord_max=COORD_MAX, task=task)
+
 
 BACKENDS = {
     "vllm": {
         "default_base_url": os.getenv("VLLM_BASE_URL"),
         "api_key": os.getenv("VLLM_API_KEY"),
+        "coord_format": "normalized",
     },
     "openai": {
         "default_base_url": "https://api.openai.com/v1",
         "api_key": os.getenv("OPENAI_API_KEY"),
+        "coord_format": "pixel",
     },
     "anthropic": {
         "default_base_url": "https://api.anthropic.com/v1",
         "api_key": os.getenv("ANTHROPIC_API_KEY"),
+        "coord_format": "pixel",
     },
 }
 
@@ -105,6 +118,7 @@ def parse_args():
         args.base_url = cfg["default_base_url"]
     if args.api_key is None:
         args.api_key = cfg["api_key"]
+    args.coord_format = cfg["coord_format"]
     if not args.base_url:
         parser.error(f"--base-url not set for backend={args.backend!r}")
     return args
@@ -147,20 +161,30 @@ def scale_bbox(bbox: list[float], scale: float) -> list[float]:
     ]
 
 
-def extract_coords(pred: dict | None) -> tuple[float, float, float, float] | None:
+def extract_coords(
+    pred: dict | None, coord_format: str, width: int, height: int
+) -> tuple[float, float, float, float] | None:
     """Return normalized (x1, y1, x2, y2) in [0, 1], or None if pred is malformed."""
     if not isinstance(pred, dict):
         return None
     keys = ("x1", "y1", "x2", "y2")
     if not all(isinstance(pred.get(k), (int, float)) for k in keys):
         return None
-    x1, y1, x2, y2 = (pred[k] / COORD_MAX for k in keys)
+    if coord_format == "pixel":
+        x1 = pred["x1"] / width
+        y1 = pred["y1"] / height
+        x2 = pred["x2"] / width
+        y2 = pred["y2"] / height
+    else:
+        x1, y1, x2, y2 = (pred[k] / COORD_MAX for k in keys)
     return x1, y1, x2, y2
 
 
-def evaluate_pred(pred: dict | None, sample: dict) -> tuple[bool, dict[int, bool]]:
+def evaluate_pred(
+    pred: dict | None, sample: dict, coord_format: str, width: int, height: int
+) -> tuple[bool, dict[int, bool]]:
     """Return (start_ok, end_ok_by_scale) for a single prediction."""
-    coords = extract_coords(pred)
+    coords = extract_coords(pred, coord_format, width, height)
     if coords is None:
         return False, {s: False for s in SCALES}
     x1, y1, x2, y2 = coords
@@ -202,15 +226,16 @@ def completion_kwargs(args) -> dict:
     return {"response_format": {"type": "json_object"}}
 
 
-async def predict(client: AsyncOpenAI, args, image_url: str, task: str) -> dict:
+async def predict(
+    client: AsyncOpenAI, args, image_url: str, width: int, height: int, task: str
+) -> dict:
+    format_json = json.dumps(build_format(args.coord_format, width, height))
+    prompt = format_prompt(args.coord_format, format_json, width, height, task)
     response = await client.chat.completions.create(
         model=args.model_id,
         messages=[
             {"role": "system", "content": "You are a GUI grounding assistant."},
-            {
-                "role": "user",
-                "content": PROMPT.format(format_json=_FORMAT_JSON, coord_max=COORD_MAX, task=task),
-            },
+            {"role": "user", "content": prompt},
             {
                 "role": "user",
                 "content": [{"type": "image_url", "image_url": {"url": image_url}}],
@@ -222,10 +247,10 @@ async def predict(client: AsyncOpenAI, args, image_url: str, task: str) -> dict:
 
 
 async def safe_predict(
-    client: AsyncOpenAI, args, image_url: str, task: str
+    client: AsyncOpenAI, args, image_url: str, width: int, height: int, task: str
 ) -> tuple[dict | None, str | None]:
     try:
-        return await predict(client, args, image_url, task), None
+        return await predict(client, args, image_url, width, height, task), None
     except Exception as e:
         return None, repr(e)
 
@@ -269,13 +294,15 @@ async def run_one(
     domain: str,
     img_path: Path,
     image_url: str,
+    width: int,
+    height: int,
     index: int,
     sample: dict,
     norm_sample: dict,
 ) -> dict:
     async with sem:
-        pred, error = await safe_predict(client, args, image_url, sample["intent"])
-    start_ok, end_by_scale = evaluate_pred(pred, norm_sample)
+        pred, error = await safe_predict(client, args, image_url, width, height, sample["intent"])
+    start_ok, end_by_scale = evaluate_pred(pred, norm_sample, args.coord_format, width, height)
     result = build_result(
         domain, img_path, index, sample, norm_sample, pred, start_ok, end_by_scale, error
     )
@@ -333,7 +360,19 @@ def build_tasks(args, client: AsyncOpenAI, sem: asyncio.Semaphore) -> list:
             "end_bbox": normalize_bbox(sample["end_bbox"], width, height),
         }
         tasks.append(
-            run_one(sem, client, args, domain, img_path, image_url, i, sample, norm_sample)
+            run_one(
+                sem,
+                client,
+                args,
+                domain,
+                img_path,
+                image_url,
+                width,
+                height,
+                i,
+                sample,
+                norm_sample,
+            )
         )
     return tasks
 
