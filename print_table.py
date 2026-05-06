@@ -1,5 +1,3 @@
-"""Print a LaTeX table of accuracy@1 from aggregated_*.json files."""
-
 import json
 import sys
 
